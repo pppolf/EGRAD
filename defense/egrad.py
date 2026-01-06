@@ -195,3 +195,77 @@ def egrad(
 
     ASR_after = evaluate_asr(args, backdoor_gen_model, idx_atk, benign_model, poison_x, overall_induct_edge_index)
     logger.info(f"[After Defense] ASR = {ASR_after:.4f}")
+
+
+def egrad_hard(
+        args,
+        backdoor_gen_model, 
+        benign_model, 
+        train_lr, 
+        weight_decay, 
+        idx_atk,
+        idx_clean_test,
+        poison_x, 
+        poison_edge_index, 
+        poison_edge_weights, 
+        overall_induct_edge_index,
+        overall_induct_edge_weights, 
+        train_mask, 
+        y_full, 
+        def_epochs, alpha, eta, tau, gamma, lambda1, R_scale, recalc_every
+    ):
+    # set_determinism(args.seed)
+    benign_model.train()
+    logger.info(f"Init weight mean: {torch.mean(torch.cat([p.flatten() for p in benign_model.parameters()])).item()}")
+    
+    with torch.no_grad():
+        out_tmp = benign_model(poison_x, poison_edge_index, poison_edge_weights)
+        pseudo_y_fixed = out_tmp[train_mask].argmax(dim=1).detach()
+
+    I_old = edge_importance_grad(benign_model, poison_x, poison_edge_index,
+                            train_mask, edge_weight=poison_edge_weights, pseudo_y=pseudo_y_fixed)
+    A_e, R_e = compute_risk_scores(poison_x, poison_edge_index, I_old,
+                                alpha=alpha, beta=(1-alpha), lambda1=lambda1, lambda2=(1-lambda1))
+
+
+    # R_scaled = (R_e - R_e.mean()) / (R_e.std() + 1e-9)
+    # R_scaled = R_scale * R_scaled
+    # def_edge_weight = attenuate_edge_weights(R_scaled, tau=tau, eta=eta)
+
+    # logger.info(f"[Defense] edge_weight stats -> min={def_edge_weight.min().item():.3f}, "
+    #             f"max={def_edge_weight.max().item():.3f}, attenuated={(def_edge_weight<0.99).sum().item()}/{def_edge_weight.numel()}")
+    # [Step 2] 硬剪枝 (Hard Pruning) 逻辑
+    # 不进行归一化和 Sigmoid，直接截断
+    # 策略：如果 R_e > tau，则删除 (weight=0)，否则保留 (weight=1)
+    mask_keep = R_e <= tau
+    def_edge_weight = torch.zeros_like(R_e)
+    def_edge_weight[mask_keep] = 1.0
+    
+    # 记录剪枝数量
+    num_pruned = (~mask_keep).sum().item()
+    logger.info(f"[Ablation: Hard] Removed {num_pruned} edges (Threshold tau={tau})")
+
+    def_opt = torch.optim.Adam(benign_model.parameters(), lr=train_lr, weight_decay=weight_decay)
+    I_ref = I_old.clone().detach()
+    for ep in range(def_epochs):
+        benign_model.train(); def_opt.zero_grad()
+        out = benign_model(poison_x, poison_edge_index, def_edge_weight)
+        ce = F.cross_entropy(out[train_mask], y_full[train_mask]) 
+
+        if (ep % recalc_every) == 0:
+            I_new = edge_importance_grad(benign_model, poison_x, poison_edge_index, train_mask, edge_weight=def_edge_weight, pseudo_y=pseudo_y_fixed)
+        else:
+            I_new = I_ref
+        exp_loss = F.mse_loss(I_new, I_ref)
+        loss = ce + gamma * exp_loss
+        loss.backward(); def_opt.step()
+
+        if (ep + 1) % 20 == 0 or ep == 0:
+            with torch.no_grad():
+                acc_tr = (out[train_mask].argmax(dim=1) == y_full[train_mask]).float().mean().item()
+            logger.info(f"[Defense] Epoch {ep+1} | loss={loss.item():.4f} | train-acc(real)={acc_tr:.4f}")
+    final_clean_acc = benign_model.test(poison_x, overall_induct_edge_index, overall_induct_edge_weights, y_full, idx_clean_test)
+    logger.info(f"[After Defense] Clean Test Acc = {final_clean_acc:.4f}")
+
+    ASR_after = evaluate_asr(args, backdoor_gen_model, idx_atk, benign_model, poison_x, overall_induct_edge_index)
+    logger.info(f"[After Defense] ASR = {ASR_after:.4f}")
